@@ -1,0 +1,622 @@
+--- original/main_script.py
++++ updated/main_script.py
+@@ -183,6 +183,9 @@
+ # cho mỗi item). Đây là single-flight ở biên ingress, không thay thế durable
+ # dedup trong SQLite.
+ _ingress_inflight: set[tuple] = set()
++# Reserve fingerprints before task creation too, so a duplicate burst does not
++# allocate many coroutines waiting on the ingress semaphore.
++_ingress_scheduled: set[tuple] = set()
+ 
+ 
+ def schedule_tracked_task(coro, task_set: set, name: str) -> asyncio.Task:
+@@ -688,14 +691,25 @@
+         return False
+ 
+ 
+-def _get_utf16_slice(text: str, offset: int, length: int) -> str:
++def _iter_spoiler_texts(text: str, entities):
++    """Yield Telegram spoiler spans, encoding the UTF-16 text only once."""
++    if not text or not entities:
++        return
+     try:
+         raw = text.encode("utf-16-le")
+-        start = int(offset) * 2
+-        end = start + int(length) * 2
+-        return raw[start:end].decode("utf-16-le", errors="ignore").strip()
+     except Exception:
+-        return ""
++        return
++    for entity in entities:
++        if not isinstance(entity, MessageEntitySpoiler):
++            continue
++        try:
++            start = max(0, int(entity.offset)) * 2
++            end = start + max(0, int(entity.length)) * 2
++            spoiler_text = raw[start:end].decode("utf-16-le", errors="ignore").strip()
++        except (AttributeError, TypeError, ValueError):
++            continue
++        if spoiler_text:
++            yield spoiler_text
+ 
+ 
+ def extract_kjc_spoiler_codes(event) -> list[str]:
+@@ -717,19 +731,9 @@
+ 
+     entities = getattr(message, "entities", None) or []
+     codes = []
+-    for entity in entities:
+-        if not isinstance(entity, MessageEntitySpoiler):
+-            continue
+-
+-        spoiler_text = _get_utf16_slice(
+-            full_text,
+-            getattr(entity, "offset", 0),
+-            getattr(entity, "length", 0),
+-        )
+-
+-        if not spoiler_text:
+-            continue
+-
++    seen_codes = set()
++    seen_candidates = set()
++    for spoiler_text in _iter_spoiler_texts(full_text, entities):
+         for line in spoiler_text.splitlines():
+             line = line.strip()
+             if not line:
+@@ -741,8 +745,10 @@
+ 
+             for candidate in candidates:
+                 cleaned = CodeValidator.clean_code(candidate)
+-                if not cleaned:
++                normalized_candidate = cleaned.upper()
++                if not cleaned or normalized_candidate in seen_candidates:
+                     continue
++                seen_candidates.add(normalized_candidate)
+ 
+                 try:
+                     result = validate_candidate(
+@@ -766,7 +772,8 @@
+                     continue
+ 
+                 code = result.get("clean_code") or cleaned
+-                if code.upper() not in {c.upper() for c in codes}:
++                if code.upper() not in seen_codes:
++                    seen_codes.add(code.upper())
+                     codes.append(code)
+                     logger.info("🎯 [KJC-SPOILER] phát hiện: %s", code)
+ 
+@@ -779,6 +786,7 @@
+             "https://xx88code.com",
+             channel_name="KJC",
+             include_text_after_spoiler=True,
++            spoiler_codes=[],
+         )
+         return unique_keep_order(codes + (fallback or []))
+     except Exception as exc:
+@@ -921,8 +929,24 @@
+         bot_state._inflight_accounts.discard((channel_key, username))
+ 
+ 
+-def _message_content_hash(text: str) -> str:
+-    return hashlib.md5((text or "").encode("utf-8", errors="ignore")).hexdigest()
++def _spoiler_entity_signature(message) -> str:
++    """Stable offsets/lengths for spoiler entities, without storing hidden text."""
++    signature = []
++    for entity in getattr(message, "entities", None) or []:
++        if not isinstance(entity, MessageEntitySpoiler):
++            continue
++        try:
++            signature.append((int(entity.offset), int(entity.length)))
++        except (AttributeError, TypeError, ValueError):
++            continue
++    return json.dumps(signature, separators=(",", ":")) if signature else ""
++
++
++def _message_content_hash(text: str, spoiler_signature: str = "") -> str:
++    payload = text or ""
++    if spoiler_signature:
++        payload = f"{payload}\x1fspoiler:{spoiler_signature}"
++    return hashlib.md5(payload.encode("utf-8", errors="ignore")).hexdigest()
+ 
+ 
+ def _ingress_fingerprint(event) -> tuple:
+@@ -937,7 +961,8 @@
+     )
+     media = getattr(message, "media", None)
+     media_type = type(media).__name__ if media is not None else ""
+-    fingerprint = _message_content_hash(f"{text}|{media_type}")
++    spoiler_signature = _spoiler_entity_signature(message)
++    fingerprint = _message_content_hash(f"{text}|{media_type}", spoiler_signature)
+     return chat_id, message_id, fingerprint
+ 
+ 
+@@ -2034,31 +2059,32 @@
+ 
+ def extract_spoiler_codes(event, target_url: str):
+     codes = []
+-    if not event.message.entities:
++    message = getattr(event, "message", None)
++    if message is None:
+         return codes
+-    full = event.message.message or event.message.text or ""
++    entities = getattr(message, "entities", None) or []
++    full = getattr(message, "message", None) or getattr(message, "text", None) or ""
+     if not full:
+         return codes
+     try:
+-        for ent in event.message.entities:
+-            if not isinstance(ent, MessageEntitySpoiler):
+-                continue
+-            try:
+-                rb = full.encode("utf-16-le")
+-                s, e = ent.offset * 2, ent.offset * 2 + ent.length * 2
+-                sp = rb[s:e].decode("utf-16-le", errors="ignore").strip()
+-            except Exception:
+-                sp = full[ent.offset: ent.offset + ent.length].strip()
+-            if not sp:
+-                continue
++        seen_codes = set()
++        seen_candidates = set()
++        for sp in _iter_spoiler_texts(full, entities):
+             for line in (sp.splitlines() if "\n" in sp else [sp]):
+                 line = line.strip()
+                 if not line:
+                     continue
+                 for tok in (extract_tokens_from_line(line) or [line]):
++                    candidate_key = CodeValidator.clean_code(tok).upper()
++                    if not candidate_key or candidate_key in seen_candidates:
++                        continue
++                    seen_candidates.add(candidate_key)
+                     v = validate_candidate(tok, target_url, source="spoiler")
+-                    if v["valid"]:
+-                        codes.append(v["clean_code"])
++                    clean_code = v.get("clean_code")
++                    normalized = str(clean_code or "").upper()
++                    if v.get("valid") and normalized and normalized not in seen_codes:
++                        seen_codes.add(normalized)
++                        codes.append(clean_code)
+                         logger.info(f"🔒 Spoiler: {v['clean_code']}")
+     except Exception as e:
+         logger.warning(f"⚠️ spoiler: {e}")
+@@ -2191,12 +2217,17 @@
+     target_url: str,
+     channel_name: str = "",
+     include_text_after_spoiler: bool = False,
++    spoiler_codes: list[str] | None = None,
+ ):
+     # Contract: spoiler is always attempted before marker/regex/OCR paths.
+     group = get_filter_group_name(target_url)
+     logger.debug(f"[EXTRACT] group={group} | url={target_url}")
+ 
+-    spoiler = extract_spoiler_codes(event, target_url)
++    spoiler = (
++        extract_spoiler_codes(event, target_url)
++        if spoiler_codes is None
++        else list(spoiler_codes)
++    )
+     if spoiler:
+         logger.warning(f"🎯 [SPOILER] {len(spoiler)}: {spoiler}")
+         # QQ88/HI88 có thể đặt nhiều mã: một phần trong spoiler và phần còn
+@@ -3419,7 +3450,8 @@
+             )
+             if caption:
+                 caption_codes = extract_codes_from_message(
+-                    event, caption, target_url, channel_name=cfg.get("name", "")
++                    event, caption, target_url, channel_name=cfg.get("name", ""),
++                    spoiler_codes=cached_codes,
+                 )
+                 cached_codes = unique_keep_order(cached_codes + (caption_codes or []))
+         elif event_media:
+@@ -3439,7 +3471,10 @@
+             )
+             found_caption = False
+             if caption:
+-                ex = extract_codes_from_message(event, caption, target_url, channel_name=cfg.get("name", ""))
++                ex = extract_codes_from_message(
++                    event, caption, target_url, channel_name=cfg.get("name", ""),
++                    spoiler_codes=[],
++                )
+                 if ex:
+                     raw_text = caption
+                     found_caption = True
+@@ -3514,7 +3549,10 @@
+                         )
+                     )
+                     if c2:
+-                        ex = extract_codes_from_message(event, c2, target_url, channel_name=cfg.get("name", ""))
++                        ex = extract_codes_from_message(
++                            event, c2, target_url, channel_name=cfg.get("name", ""),
++                            spoiler_codes=[],
++                        )
+                         if ex:
+                             raw_text = c2
+                         else:
+@@ -3686,6 +3724,11 @@
+ 
+ async def process_telegram_message(event):
+     timer = RequestTimer.from_event(event, kind="telegram_request")
++    queue_wait_ms = getattr(event, "queue_wait_ms", None)
++    if queue_wait_ms is not None:
++        queue_wait_seconds = max(0.0, float(queue_wait_ms)) / 1000.0
++        timer.started_perf -= queue_wait_seconds
++        timer.stages["ingress_queue_wait"] = queue_wait_seconds
+     tok = set_current_timer(timer)
+     cfg = Config.CHANNEL_CONFIG.get(getattr(event, "chat_id", None))
+     tag = get_site_log_tag(cfg.get("url", "")) if cfg else f"chat_{getattr(event,'chat_id','?')}"
+@@ -3720,11 +3763,13 @@
+         claimed_row_id = None
+         row = None
+         claimed_token = None
++        queue_age_ms = None
++        queued_at_perf = None
+         try:
+             item = await asyncio.wait_for(message_queue.get(), timeout=1.0)
+             if isinstance(item, tuple) and len(item) == 2:
+-                queued_at, row_id = item
+-                queue_age_ms = (time.perf_counter() - queued_at) * 1000
++                queued_at_perf, row_id = item
++                queue_age_ms = (time.perf_counter() - queued_at_perf) * 1000
+                 if queue_age_ms > 500:
+                     logger.warning(
+                         "🐌 Telegram message queue delay %.0fms | qsize=%s/%s",
+@@ -3761,14 +3806,6 @@
+                     continue
+                 claimed_row_id = int(row_id)
+                 claimed_token = row.get("claim_token")
+-                if await asyncio.get_running_loop().run_in_executor(
+-                    _INBOX_STATE_EXECUTOR,
+-                    inbox.has_active_work_items,
+-                    int(row_id),
+-                ):
+-                    # Recovery path: the item drain loop will resume pending
+-                    # domain/account work items; do not replay Telegram text.
+-                    continue
+                 # A row in DurableInbox is proof that this process already
+                 # accepted the event.  Process it even when
+                 # TELEGRAM_CATCH_UP=false; that flag only prevents replaying
+@@ -3778,6 +3815,14 @@
+                 # hoặc item đã nằm quá lâu trong durable inbox).
+                 msg = _inbox_message_cache.pop(int(row_id), None)
+                 if msg is None:
++                    if await asyncio.get_running_loop().run_in_executor(
++                        _INBOX_STATE_EXECUTOR,
++                        inbox.has_active_work_items,
++                        int(row_id),
++                    ):
++                        # Recovery path: the item drain loop will resume pending
++                        # domain/account work items; do not replay Telegram text.
++                        continue
+                     msg = await client.get_messages(int(row["chat_id"]), ids=int(row["message_id"]))
+                 if not msg:
+                     # ✅ FIX: retry_or_fail (bound) thay vì retry() vô hạn —
+@@ -3797,6 +3842,10 @@
+                     media=getattr(msg, "media", None),
+                     inbox_id=int(row_id),
+                     claim_token=claimed_token,
++                    queue_wait_ms=(
++                        (time.perf_counter() - queued_at_perf) * 1000
++                        if queued_at_perf is not None else None
++                    ),
+                 )
+                 await process_telegram_message(ev)
+                 await asyncio.get_running_loop().run_in_executor(
+@@ -4111,8 +4160,14 @@
+ 
+         return message_date >= cutoff
+ 
+-    async def _enqueue_event_inner(ev, edited: bool = False) -> bool:
++    async def _enqueue_event_inner(
++        ev,
++        edited: bool = False,
++        ingress_started_perf: float | None = None,
++    ) -> bool:
+         global _queue_full_counter
++        if ingress_started_perf is None:
++            ingress_started_perf = time.perf_counter()
+ 
+         if not quick(ev):
+             return False
+@@ -4143,13 +4198,21 @@
+             # của các domain worker.
+             # hàng loạt lệnh retry cũ trên cùng threadpool, gây delay nhận
+             # tin thực tế dù event Telethon đã tới kịp thời.
++            enqueue_text = str(getattr(msg, "text", None) or getattr(msg, "message", None) or "")
++            enqueue_has_media = bool(getattr(msg, "media", None))
++            enqueue_content_hash = DurableInbox.content_hash(
++                enqueue_text,
++                enqueue_has_media,
++                _spoiler_entity_signature(msg),
++            )
+             enqueue_args = (
+                 chat_id,
+                 int(getattr(msg, "id", 0) or 0),
+                 getattr(msg, "date", None),
+                 edited,
+-                str(getattr(msg, "text", None) or getattr(msg, "message", None) or ""),
+-                bool(getattr(msg, "media", None)),
++                enqueue_text,
++                enqueue_has_media,
++                enqueue_content_hash,
+             )
+             # DurableInbox.enqueue converts transient SQLite failures into
+             # ``None`` so callers cannot receive a DB exception. Retry here
+@@ -4192,6 +4255,7 @@
+         # a later delivery must still get another chance.
+         _mark_ingress_seen(ev)
+         _ingress_inflight.discard(ingress_key)
++        ingress_to_durable_ms = (time.perf_counter() - ingress_started_perf) * 1000.0
+ 
+         # Giữ message object của event realtime để worker không phải gọi lại
+         # client.get_messages() qua mạng. Chỉ giữ giới hạn nhỏ trong RAM;
+@@ -4213,11 +4277,16 @@
+                 _inbox_wakeup.set()
+             cfg = Config.CHANNEL_CONFIG.get(chat_id, {})
+             logger.info(
+-                "📨 [Telegram accepted] chat_id=%s name=%s message_id=%s media=%s",
++                "📨 [Telegram accepted] chat_id=%s name=%s message_id=%s media=%s "
++                "ingress_to_durable_ms=%.1f ingress_tasks=%s queue=%s/%s",
+                 chat_id,
+                 cfg.get("name", ""),
+                 getattr(getattr(ev, "message", None), "id", "?"),
+                 bool(getattr(getattr(ev, "message", None), "media", None)),
++                ingress_to_durable_ms,
++                len(_ingress_tasks),
++                message_queue.qsize(),
++                message_queue.maxsize,
+             )
+             bot_state.last_accepted_message_at = time.monotonic()
+             bot_state.accepted_message_count += 1
+@@ -4234,9 +4303,14 @@
+             )
+             return False
+     async def enqueue_event(ev, edited: bool = False) -> bool:
++        ingress_started_perf = time.perf_counter()
+         async with _get_ingress_semaphore():
+             try:
+-                return await _enqueue_event_inner(ev, edited=edited)
++                return await _enqueue_event_inner(
++                    ev,
++                    edited=edited,
++                    ingress_started_perf=ingress_started_perf,
++                )
+             finally:
+                 # Không để một exception bất ngờ làm kẹt fingerprint vĩnh viễn
+                 # trong single-flight set; durable SQLite vẫn là lớp dedup cuối.
+@@ -4244,11 +4318,28 @@
+ 
+     def _schedule_ingress_enqueue(ev, edited: bool = False) -> None:
+         """Schedule durable ingress without blocking Telethon's callback."""
+-        schedule_tracked_task(
+-            enqueue_event(ev, edited=edited),
+-            _ingress_tasks,
+-            name=f"telegram-ingress-{getattr(getattr(ev, 'message', None), 'id', 'unknown')}",
+-        )
++        ingress_key = _ingress_fingerprint(ev)
++        if ingress_key in _ingress_scheduled or ingress_key in _ingress_inflight:
++            return
++        _ingress_scheduled.add(ingress_key)
++
++        async def _run_scheduled_ingress():
++            try:
++                return await enqueue_event(ev, edited=edited)
++            finally:
++                _ingress_scheduled.discard(ingress_key)
++
++        ingress_coro = _run_scheduled_ingress()
++        try:
++            schedule_tracked_task(
++                ingress_coro,
++                _ingress_tasks,
++                name=f"telegram-ingress-{getattr(getattr(ev, 'message', None), 'id', 'unknown')}",
++            )
++        except Exception:
++            ingress_coro.close()
++            _ingress_scheduled.discard(ingress_key)
++            raise
+ 
+     async def h_new(ev):
+         try:
+@@ -4285,11 +4376,12 @@
+         bot_state.last_raw_update_at = time.monotonic()
+         bot_state.raw_update_count += 1
+ 
+-    # Đăng ký không lọc ở tầng Telethon. Khi source_filter=False, mọi
+-    # NewMessage/MessageEdited đi vào durable ingress trước, rồi worker mới
+-    # lọc channel và loại nội dung. Bật source_filter chỉ để giảm tải có chủ ý.
+-    client.add_event_handler(h_new, events.NewMessage())
+-    client.add_event_handler(h_edit, events.MessageEdited())
++    # Chặn event ngoài cấu hình ngay tại Telethon khi source filter đang bật.
++    # Raw vẫn không lọc để giữ phép đo heartbeat/update toàn cục.
++    new_message_filter = events.NewMessage(chats=chats) if source_filter else events.NewMessage()
++    message_edited_filter = events.MessageEdited(chats=chats) if source_filter else events.MessageEdited()
++    client.add_event_handler(h_new, new_message_filter)
++    client.add_event_handler(h_edit, message_edited_filter)
+     client.add_event_handler(h_raw, events.Raw())
+ 
+     bot_state.handler_registered = True
+@@ -4301,7 +4393,7 @@
+ 
+     logger.info(
+         "✅ Handler ready | %s channels | QQ88=%s HI88=%s | OCR-only=%s | "
+-        "deferred ingress filter=%s + dedup + raw-update probe enabled",
++        "Telethon chat filter=%s + deferred validation + dedup + raw-update probe enabled",
+         len(chats),
+         domain_counts.get("tangquaqq88.com", 0),
+         domain_counts.get("hi88-freecode.pages.dev", 0),
+@@ -4999,4 +5091,4 @@
+     try:
+         asyncio.run(main())
+     except KeyboardInterrupt:
+-        print("\n🛑 Stopped")+        print("\n🛑 Stopped")
+--- original/durable_inbox.py
++++ updated/durable_inbox.py
+@@ -101,6 +101,8 @@
+                     ON telegram_inbox(status, next_attempt_at, id);
+                 CREATE INDEX IF NOT EXISTS idx_inbox_message
+                     ON telegram_inbox(chat_id, message_id);
++                CREATE INDEX IF NOT EXISTS idx_inbox_retention
++                    ON telegram_inbox(status, completed_at);
+                 CREATE TABLE IF NOT EXISTS telegram_inbox_items (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     inbox_id INTEGER NOT NULL,
+@@ -234,6 +236,9 @@
+             self._conn.execute(
+                 "CREATE INDEX IF NOT EXISTS idx_inbox_message ON telegram_inbox(chat_id, message_id)"
+             )
++            self._conn.execute(
++                "CREATE INDEX IF NOT EXISTS idx_inbox_retention ON telegram_inbox(status, completed_at)"
++            )
+             self._conn.commit()
+ 
+             kept, total = len(best), len(rows)
+@@ -252,8 +257,15 @@
+             raise
+ 
+     @staticmethod
+-    def content_hash(text: str = "", has_media: bool = False) -> str:
+-        payload = f"{text or ''}\x1f{int(bool(has_media))}".encode("utf-8", "ignore")
++    def content_hash(
++        text: str = "",
++        has_media: bool = False,
++        spoiler_signature: str = "",
++    ) -> str:
++        payload_text = f"{text or ''}\x1f{int(bool(has_media))}"
++        if spoiler_signature:
++            payload_text = f"{payload_text}\x1fspoiler:{spoiler_signature}"
++        payload = payload_text.encode("utf-8", "ignore")
+         return hashlib.sha256(payload).hexdigest()[:32]
+ 
+     @staticmethod
+@@ -731,9 +743,28 @@
+ 
+     def purge_completed(self, keep_days: int = 7) -> int:
+         with self._lock:
++            cutoff = f"-{max(1, int(keep_days))} days"
++            # Foreign-key enforcement is intentionally not assumed for older
++            # databases. Remove children explicitly before their expired parent,
++            # and clean orphan work items left by earlier versions of the purge.
++            self._conn.execute(
++                """
++                DELETE FROM telegram_inbox_items
++                WHERE NOT EXISTS (
++                    SELECT 1 FROM telegram_inbox r
++                    WHERE r.id = telegram_inbox_items.inbox_id
++                )
++                OR inbox_id IN (
++                    SELECT id FROM telegram_inbox
++                    WHERE status IN ('completed', 'ignored')
++                      AND completed_at < datetime('now', ?)
++                )
++                """,
++                (cutoff,),
++            )
+             cur = self._conn.execute(
+                 "DELETE FROM telegram_inbox WHERE status IN ('completed','ignored') AND completed_at < datetime('now', ?)",
+-                (f"-{max(1, int(keep_days))} days",),
++                (cutoff,),
+             )
+             self._conn.commit()
+             return int(cur.rowcount or 0)
+--- original/config.py
++++ updated/config.py
+@@ -889,8 +889,9 @@
+             TELEGRAM_INBOX_RECOVERY_MODE,
+         )
+         TELEGRAM_INBOX_RECOVERY_MODE = "live_only"
+-    # Chỉ nhận event từ CHANNEL_CONFIG ngay tại Telethon/quick(); tránh đưa
+-    # chat ngoài danh sách vào DurableInbox và tạo tải giả cho worker.
++    # Chỉ nhận callback NewMessage/MessageEdited từ CHANNEL_CONFIG ngay tại
++    # Telethon, sau đó quick() kiểm tra lại để phòng filter/entity edge cases.
++    # Tắt cờ này chỉ dành cho chẩn đoán; Raw update probe vẫn luôn toàn cục.
+     TELEGRAM_FILTER_AT_SOURCE     = get_bool_env("TELEGRAM_FILTER_AT_SOURCE", True)
+     # Chỉ bật khi chẩn đoán peer/channel ID; mặc định không log mọi event
+     # Telegram để tránh làm nghẽn event loop.
+@@ -1110,4 +1111,4 @@
+         raise ValueError(
+             f"LỖI CẤU HÌNH: filter_group '{group}' (site '{site.get('name', 'Unknown')}') "
+             f"chưa được định nghĩa trong CODE_FILTER_GROUPS!"
+-        )+        )
+--- original/browser_engine.py
++++ updated/browser_engine.py
+@@ -1588,7 +1588,15 @@
+     @staticmethod
+     def _new_entry(page):
+         now = time.monotonic()
+-        return {"page": page, "lock": asyncio.Lock(), "created_at": now, "last_used": now, "reserved": False}
++        return {
++            "page": page,
++            "lock": asyncio.Lock(),
++            "created_at": now,
++            "last_used": now,
++            "last_memory_maintenance": now,
++            "last_memory_reload": now,
++            "reserved": False,
++        }
+ 
+     @staticmethod
+     def _touch(entry):
+@@ -1902,7 +1910,7 @@
+                         and not lock.locked()
+                         and now - float(entry.get("last_used", now)) >= idle_ttl
+                     )
+-                    if lock.locked() or (not is_closed and not is_idle_spare):
++                    if entry.get("reserved") or lock.locked() or (not is_closed and not is_idle_spare):
+                         survivors.append(entry)
+                         continue
+ 
+@@ -1962,11 +1970,13 @@
+             for entry in entries:
+                 page = entry.get("page")
+                 lock = entry.get("lock")
+-                if lock is None or lock.locked() or safe_is_closed(page):
++                if lock is None or lock.locked() or entry.get("reserved") or safe_is_closed(page):
+                     skipped += 1
+                     continue
+                 idle = now - float(entry.get("last_used", now))
+-                if idle < max(30.0, float(compact_idle_seconds)):
++                compact_interval = max(30.0, float(compact_idle_seconds))
++                last_maintenance = float(entry.get("last_memory_maintenance", entry.get("last_used", now)))
++                if idle < compact_interval or now - last_maintenance < compact_interval:
+                     continue
+                 try:
+                     if await is_cloudflare_present(page, domain=domain):
+@@ -1976,18 +1986,18 @@
+                     skipped += 1
+                     continue
+ 
+-                if (
+-                    not reloaded_this_domain
+-                    and idle >= max(float(compact_idle_seconds), float(reload_idle_seconds))
+-                ):
++                reload_threshold = max(compact_interval, float(reload_idle_seconds))
++                last_reload = float(entry.get("last_memory_reload", entry.get("last_used", now)))
++                if not reloaded_this_domain and idle >= reload_threshold and now - last_reload >= reload_threshold:
+                     try:
+                         await page.reload(
+                             wait_until="domcontentloaded",
+                             timeout=int(getattr(Config, "PAGE_NAVIGATION_TIMEOUT", 10000)),
+                         )
+                         await _close_unwanted_popups(page)
+-                        _touch = self._touch
+-                        _touch(entry)
++                        maintenance_at = time.monotonic()
++                        entry["last_memory_maintenance"] = maintenance_at
++                        entry["last_memory_reload"] = maintenance_at
+                         reloaded += 1
+                         reloaded_this_domain = True
+                         continue
+@@ -2012,9 +2022,12 @@
+                         }
+                         """
+                     )
+-                    self._touch(entry)
++                    # Maintenance is not a user submit: don't reset last_used,
++                    # otherwise periodic compaction starves the reload threshold.
++                    entry["last_memory_maintenance"] = time.monotonic()
+                     compacted += 1
+                 except Exception as exc:
++                    entry["last_memory_maintenance"] = time.monotonic()
+                     logger.debug("⚠️ [TabPool-Memory] compact %s lỗi: %s", domain, exc)
+         return {"compacted": compacted, "reloaded": reloaded, "skipped": skipped}
+ 
